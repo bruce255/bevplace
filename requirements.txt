@@ -1,0 +1,8 @@
+faiss-cpu
+numpy
+opencv-python
+scikit-image
+scikit-learn
+tqdm
+h5py
+tensorboardX
