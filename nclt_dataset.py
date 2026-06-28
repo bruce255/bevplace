@@ -13,7 +13,7 @@ import faiss
 
 
 class InferDataset(data.Dataset):
-    def __init__(self, seq, dataset_path = './datasets/NCLT/'):
+    def __init__(self, seq, dataset_path = '/kaggle/input/datasets/laipinghung/bev-dataset/datasets/nclt/'):
         super().__init__()
 
         # bev path

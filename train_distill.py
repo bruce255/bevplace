@@ -89,6 +89,8 @@ def train_epoch_distill(epoch, teacher_model, student_model, train_set, optimize
             student_model.eval()
             with torch.no_grad():
                 for iteration, (query, _, _, indices) in enumerate(training_data_loader, 1):
+                    if query is None:
+                        continue
                     query = query.to(device)
                     _, _, global_descs = student_model(query)
                     h5feat[indices, :] = global_descs.detach().cpu().numpy()
@@ -117,6 +119,8 @@ def train_epoch_distill(epoch, teacher_model, student_model, train_set, optimize
     student_model.train()
 
     for iteration, (query, positives, negatives, indices) in enumerate(training_data_loader):
+        if query is None:
+            continue
         B = query.shape[0]
         num_negs = negatives.shape[0] // B
 
@@ -242,7 +246,7 @@ if __name__ == "__main__":
             opt.teacher_path = found
 
     if isfile(opt.teacher_path):
-        checkpoint = torch.load(opt.teacher_path, map_location=device)
+        checkpoint = torch.load(opt.teacher_path, map_location=device, weights_only=False)
         teacher.load_state_dict(checkpoint['state_dict'])
         # 確保老師模型的參數不會計算梯度，避免不必要的顯存消耗
         for param in teacher.parameters():
