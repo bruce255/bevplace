@@ -246,7 +246,7 @@ if __name__ == "__main__":
             opt.teacher_path = found
 
     if isfile(opt.teacher_path):
-        checkpoint = torch.load(opt.teacher_path, map_location=device)
+        checkpoint = torch.load(opt.teacher_path, map_location=device, weights_only=False)
         teacher.load_state_dict(checkpoint['state_dict'])
         # 確保老師模型的參數不會計算梯度，避免不必要的顯存消耗
         for param in teacher.parameters():

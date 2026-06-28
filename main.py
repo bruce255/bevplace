@@ -263,7 +263,7 @@ if __name__ == "__main__":
         resume_ckpt = join(opt.load_from, 'model_best.pth.tar' if opt.ckpt.lower() == 'best' else 'checkpoint.pth.tar')
         if isfile(resume_ckpt):
             print(f"=> loading checkpoint '{resume_ckpt}'")
-            checkpoint = torch.load(resume_ckpt, map_location=device)
+            checkpoint = torch.load(resume_ckpt, map_location=device, weights_only=False)
             model.load_state_dict(checkpoint['state_dict'])
         else:
             print(f"=> no checkpoint found at '{resume_ckpt}'")
