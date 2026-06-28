@@ -160,7 +160,7 @@ def evaluateResults(seq, global_descs, local_feats, dataset, match_results_save_
 
 def collate_fn(batch):
     batch = list(filter (lambda x:x is not None, batch))
-    if len(batch) == 0: return None, None, None, None, None, None
+    if len(batch) == 0: return None, None, None, None
 
     query, positive, negatives, indices = zip(*batch)
 

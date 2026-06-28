@@ -67,7 +67,8 @@ class REM(nn.Module):
         
         # cnn backbone
         pretrain = not from_scratch
-        encoder = models.resnet34(pretrained=pretrain) #resnet34
+        weights = models.ResNet34_Weights.IMAGENET1K_V1 if pretrain else None
+        encoder = models.resnet34(weights=weights) #resnet34
         layers = list(encoder.children())[:-4]
         self.encoder = nn.Sequential(*layers)
 
@@ -184,7 +185,8 @@ class StudentREM(nn.Module):
         self.target_dim = target_dim
         
         # 實作更小的 Backbone：使用預訓練的 MobileNetV3 Large
-        mobilenet = models.mobilenet_v3_large(pretrained=not from_scratch)
+        weights = models.MobileNet_V3_Large_Weights.IMAGENET1K_V1 if not from_scratch else None
+        mobilenet = models.mobilenet_v3_large(weights=weights)
         # 抽取前 11 個特徵層，此時輸出通道數（C）為 80
         self.encoder = nn.Sequential(*list(mobilenet.features[:11]))
         
@@ -258,7 +260,9 @@ class StudentREIN(nn.Module):
         
         # 為了能和老師的 Global Descriptor (8192維) 計算 Loss_Global，並且相容 main.py 的 Cache 與測試系統
         # 我們將 Attention 加權後的特徵圖 Flatten，再用一個全連接層（Linear）投影到 8192 維度！
-        # 註：若輸入 BEV 影像為 160x160，降採樣 4 倍後特徵圖即為 40x40
+        # 使用 Adaptive Average Pooling 固定輸出空間尺寸，使模型相容任意輸入影像大小
+        self.feat_h = feat_h
+        self.feat_w = feat_w
         self.flat_features_dim = 128 * feat_h * feat_w
         self.fc_global = nn.Linear(self.flat_features_dim, teacher_global_dim)
 
@@ -273,14 +277,16 @@ class StudentREIN(nn.Module):
         # 2. 將 out1 餵入幾何空間注意力機制中
         attn_feats = self.spatial_attention(out1)
         
-        # 3. 展平並映射成全局描述子（Global Descriptor）
+        # 3. 使用 Adaptive Average Pooling 固定空間維度，確保任意輸入大小都能正確展平
         B = x.size(0)
-        flat_feats = attn_feats.view(B, -1)
+        pooled = F.adaptive_avg_pool2d(attn_feats, (self.feat_h, self.feat_w))
+        flat_feats = pooled.view(B, -1)
         global_desc = self.fc_global(flat_feats)
         global_desc = F.normalize(global_desc, p=2, dim=1) # L2 歸一化
         
         # 防護：確保 local_feats 為 4D 張量 (B, C, H, W)，否則上游的插值會失敗
         if local_feats.dim() != 4:
             raise RuntimeError(f"StudentREIN.forward: local_feats 必須為 4D 張量 (B,C,H,W)，目前形狀 {tuple(local_feats.shape)}")
+
 
         return out1, local_feats, global_desc
