@@ -12,7 +12,7 @@ import gc  # 強制記憶體回收
 kitti_seq_split_points = {"00":3000, "02":3400, "05":1000, "06":600, '08':1000}
 
 class InferDataset(data.Dataset):
-    def __init__(self, seq, dataset_path = './datasets/KITTI/', sample_inteval=1):
+    def __init__(self, seq, dataset_path = '/kaggle/input/datasets/laipinghung/bev-dataset/datasets/kitti/', sample_inteval=1):
         super().__init__()
 
         self.sample_inteval = sample_inteval
@@ -176,7 +176,7 @@ def collate_fn(batch):
 
 
 class TrainingDataset(data.Dataset):
-    def __init__(self, dataset_path = './datasets/KITTI/',seq='00'):
+    def __init__(self, dataset_path = '/kaggle/input/datasets/laipinghung/bev-dataset/datasets/kitti/',seq='00'):
         super().__init__()
 
         # bev path
