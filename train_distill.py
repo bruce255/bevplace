@@ -21,16 +21,16 @@ from tqdm import tqdm
 
 import kitti_dataset
 import nclt_dataset 
-# 從修改後的 REIN.py 引入老師與學生模型
+import REIN as rein_module
 from REIN import REIN, StudentREIN
 
 def get_args():
-    parser = argparse.ArgumentParser(description='BEVPlace++ 知識蒸餾')
+    parser = argparse.ArgumentParser(description='BEVPlace++ 知識蒸餾（治本修正版）')
     parser.add_argument('--batchSize', type=int, default=4, help='Number of triplets')
-    parser.add_argument('--cacheBatchSize', type=int, default=128, help='Batch size for caching and testing')
-    parser.add_argument('--nEpochs', type=int, default=40, help='number of epochs to train for')
+    parser.add_argument('--cacheBatchSize', type=int, default=8, help='Batch size for caching and testing')
+    parser.add_argument('--nEpochs', type=int, default=10, help='number of epochs to train for')
     parser.add_argument('--lr', type=float, default=0.0001, help='Learning Rate.')
-    parser.add_argument('--threads', type=int, default=24, help='Number of threads for data loader')
+    parser.add_argument('--threads', type=int, default=4, help='Number of threads for data loader')
     parser.add_argument('--seed', type=int, default=1024, help='Random seed to use.')
     parser.add_argument('--runsPath', type=str, default='./runs_distill/', help='Path to save runs to.')
     parser.add_argument('--cachePath', type=str, default='./cache_distill/', help='Path to save cache to.')
@@ -38,28 +38,22 @@ def get_args():
     parser.add_argument('--kitti_path', type=str, default='./datasets/KITTI/', help='KITTI 資料集根目錄')
     parser.add_argument('--nclt_path', type=str, default='./datasets/NCLT/', help='NCLT 資料集根目錄')
     
-    # 蒸餾超參數 (公式中的 α 和 β)
+    # 數學對齊後，超參數回歸正常合理的 1.0 範圍
     parser.add_argument('--alpha', type=float, default=1.0, help='Loss_Global 權重')
-    parser.add_argument('--beta', type=float, default=2.0, help='Loss_Spatial 權重')
+    parser.add_argument('--beta', type=float, default=1.0, help='Loss_Spatial 權重')
     
     opt = parser.parse_args()
     return opt
 
-# 沿用原作者 main.py 定義的 TripletLoss
 class TripletLoss(nn.Module):
     def __init__(self):
         super(TripletLoss, self).__init__()
         self.margin = 0.3
     def forward(self, anchor, positive, negative):
-        # Robust implementation that handles 1D (vector) or 2D (batch x dim) inputs.
-        # anchor: (D,) or (D,) when called per-sample in training loop
-        # positive: (D,) or (D,) ; negative: (Nneg, D)
         if anchor.dim() == 1:
-            # single-anchor case
             pos_dist = torch.norm(anchor - positive, p=2)
             neg_dist = torch.norm(anchor.unsqueeze(0) - negative, dim=1, p=2)
         else:
-            # fallback for unexpected shapes: compute along last dim
             pos_dist = torch.norm(anchor - positive, dim=-1, p=2)
             neg_dist = torch.norm(anchor.unsqueeze(1) - negative, dim=-1, p=2)
 
@@ -70,39 +64,39 @@ def train_epoch_distill(epoch, teacher_model, student_model, train_set, optimize
     epoch_loss = 0
     n_batches = (len(train_set) + opt.batchSize - 1) // opt.batchSize
     
-    # 1. Building Cache (對齊作者原版，但改用學生模型計算特徵與挖掘)
+    # ====== 1. Building Cache (🔥 核心對齊：強迫用 99% 的老師來幫學生做 Hard Mining 篩選) ======
     if epoch >= 0:
-        print('====> Building Cache for Hard Mining (Student Model)')
+        print('====> Building Cache for Hard Mining (Using 99% Teacher Model)')
         train_set.mining = False
         train_set.cache = join(opt.cachePath, 'train_feat_cache.hdf5')
         
         if not exists(opt.cachePath):
             makedirs(opt.cachePath)
             
-        # Safe write: write to a temporary HDF5 then atomically replace the final cache
         tmp_cache = train_set.cache + '.tmp'
         with h5py.File(tmp_cache, mode='w') as h5: 
-            pool_size = student_model.global_feat_dim  # 已對齊為 8192 維度
+            # 注意：這裡的 pool_size 必須是老師模型的輸出維度（也是學生的 global_feat_dim，兩者均為 8192）
+            pool_size = teacher_model.global_feat_dim  
             h5feat = h5.create_dataset("features", [len(train_set), pool_size], dtype=np.float32)
             
             training_data_loader = DataLoader(dataset=train_set, num_workers=opt.threads, 
                                              batch_size=opt.cacheBatchSize, shuffle=False, 
                                              collate_fn=kitti_dataset.collate_fn)
-            student_model.eval()
+            
+            # 凍結老師進行高質量快取提取
+            teacher_model.eval()
             with torch.no_grad():
                 for iteration, (query, _, _, indices) in enumerate(training_data_loader, 1):
                     query = query.to(device)
-                    _, _, global_descs = student_model(query)
+                    _, _, global_descs = teacher_model(query)
                     h5feat[indices, :] = global_descs.detach().cpu().numpy()
 
-        # atomically replace tmp -> final to avoid partial/corrupt cache on crashes
         try:
             os.replace(tmp_cache, train_set.cache)
         except Exception:
-            # best-effort: if atomic replace not supported, fallback to rename
             try:
                 os.rename(tmp_cache, train_set.cache)
-            except Exception as e:
+            except Exception:
                 raise
 
         train_set.mining = True
@@ -110,12 +104,12 @@ def train_epoch_distill(epoch, teacher_model, student_model, train_set, optimize
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # 2. 蒸餾訓練主循環
+    # ====== 2. 蒸餾訓練主循環 ======
     training_data_loader = DataLoader(dataset=train_set, num_workers=opt.threads, 
                                      batch_size=opt.batchSize, shuffle=True, 
                                      collate_fn=kitti_dataset.collate_fn)
     
-    teacher_model.eval() # 老師不更新權重
+    teacher_model.eval() 
     student_model.train()
 
     for iteration, (query, positives, negatives, indices) in enumerate(training_data_loader):
@@ -128,18 +122,20 @@ def train_epoch_distill(epoch, teacher_model, student_model, train_set, optimize
 
         optimizer.zero_grad()
 
-        # --- 步驟一：老師提取特徵 (不計梯度) ---
+        # 老師同步提取完整三元組特徵
         with torch.no_grad():
             _, t_local_Q, t_global_Q = teacher_model(query)
+            _, t_local_P, t_global_P = teacher_model(positives)
+            _, t_local_N, t_global_N = teacher_model(negatives)
 
-        # --- 步驟二：學生提取特徵 ---
+        # 學生提取對應特徵
         _, s_local_Q, s_global_Q = student_model(query)
-        _, _, s_global_P = student_model(positives)
-        _, _, s_global_N = student_model(negatives)
+        _, s_local_P, s_global_P = student_model(positives)
+        _, s_local_N, s_global_N = student_model(negatives)
 
-        # --- 步驟三：實作你的損失函數公式 ---
+        # --- 損失函數計算 ---
         
-        # 1. Loss_Triplet (學生自學)
+        # (1) Loss_Triplet (學生自學，維護基本邊界)
         loss_triplet = torch.tensor(0.0, device=device)
         for i in range(B):
             max_loss = torch.max(criterion(
@@ -150,34 +146,39 @@ def train_epoch_distill(epoch, teacher_model, student_model, train_set, optimize
             loss_triplet += max_loss
         loss_triplet /= B
         
-        # 2. Loss_Global (跟老師學全局特徵：用學生的 Attention+Linear 逼近老師的 NetVLAD)
-        # Ensure shapes are compatible for MSE; raise informative error if not
-        try:
-            if s_global_Q.shape != t_global_Q.shape:
-                raise RuntimeError(f"Global descriptor shape mismatch: {s_global_Q.shape} vs {t_global_Q.shape}. Ensure student global dim matches teacher.")
-            loss_global = distill_criterion(s_global_Q, t_global_Q)
-        except Exception as e:
-            print(f"Error computing global distillation loss: {e}")
-            raise
+        # (2) Loss_Global (全局特徵蒸餾 - 採用 sum 並除以實際總元素量，治本對齊數量級)
+        total_samples = B + B + (B * num_negs)
+        loss_global_sum = distill_criterion(s_global_Q, t_global_Q) + \
+                           distill_criterion(s_global_P, t_global_P) + \
+                           distill_criterion(s_global_N, t_global_N)
+        loss_global = loss_global_sum / total_samples
         
-        # 3. Loss_Spatial (跟老師學空間幾何：用學生的 Spatial Attention 逼近老師的空間特徵)
-        try:
-            # If spatial maps differ in spatial size, resize student map to teacher's spatial dims
-            if s_local_Q.shape != t_local_Q.shape:
-                if s_local_Q.dim() == 4 and t_local_Q.dim() == 4:
-                    # interpolate student spatial map to match teacher HxW
-                    s_local_Q = F.interpolate(s_local_Q, size=(t_local_Q.size(2), t_local_Q.size(3)), mode='bilinear', align_corners=False)
-                else:
-                    raise RuntimeError(f"Spatial feature shape mismatch: {s_local_Q.shape} vs {t_local_Q.shape}")
-            loss_spatial = distill_criterion(s_local_Q, t_local_Q)
-        except Exception as e:
-            print(f"Error computing spatial distillation loss: {e}")
-            raise
+        # (3) Loss_Spatial (空間特徵蒸餾 - 壓縮通道維度，避免規格不對稱)
+        t_spatial_Q = t_local_Q.mean(dim=1, keepdim=True)
+        t_spatial_P = t_local_P.mean(dim=1, keepdim=True)
+        t_spatial_N = t_local_N.mean(dim=1, keepdim=True)
+
+        s_spatial_Q = s_local_Q.mean(dim=1, keepdim=True)
+        s_spatial_P = s_local_P.mean(dim=1, keepdim=True)
+        s_spatial_N = s_local_N.mean(dim=1, keepdim=True)
+
+        if s_spatial_Q.shape[2:] != t_spatial_Q.shape[2:]:
+            s_spatial_Q = F.interpolate(s_spatial_Q, size=t_spatial_Q.shape[2:], mode='bilinear', align_corners=False)
+            s_spatial_P = F.interpolate(s_spatial_P, size=t_spatial_P.shape[2:], mode='bilinear', align_corners=False)
+            s_spatial_N = F.interpolate(s_spatial_N, size=t_spatial_N.shape[2:], mode='bilinear', align_corners=False)
+
+        spatial_pixels = t_spatial_Q.shape[2] * t_spatial_Q.shape[3]
+        total_spatial_elements = total_samples * spatial_pixels
         
-        # 4. 總損失函數結合
+        loss_spatial_sum = distill_criterion(s_spatial_Q, t_spatial_Q) + \
+                            distill_criterion(s_spatial_P, t_spatial_P) + \
+                            distill_criterion(s_spatial_N, t_spatial_N)
+        loss_spatial = loss_spatial_sum / total_spatial_elements
+        
+        # 總損失結合
         loss_total = loss_triplet + (opt.alpha * loss_global) + (opt.beta * loss_spatial)
 
-        # --- 步驟四：反向傳播更新學生 ---
+        # 反向傳播與更新
         loss_total.backward()
         optimizer.step()
 
@@ -203,7 +204,7 @@ def infer(eval_set, model_ptr, opt, device):
     test_data_loader = DataLoader(dataset=eval_set, num_workers=opt.threads, batch_size=opt.cacheBatchSize, shuffle=False)
     model_ptr.eval()
     num_samples = len(eval_set)
-    global_dim = model_ptr.global_feat_dim  # 8192 維度
+    global_dim = model_ptr.global_feat_dim  
     all_global_descs = np.zeros((num_samples, global_dim), dtype=np.float32)
     
     with torch.no_grad():
@@ -222,6 +223,8 @@ if __name__ == "__main__":
     opt = get_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    print(f"===> 載入的 REIN.py: {rein_module.__file__}")
+
     random.seed(opt.seed)
     np.random.seed(opt.seed)
     torch.manual_seed(opt.seed)
@@ -230,7 +233,7 @@ if __name__ == "__main__":
 
     print('===> 載入預訓練的 ResNet34 + NetVLAD 老師模型')
     teacher = REIN().to(device)
-    # If provided path doesn't exist, try to auto-discover under /kaggle/input
+    
     if not isfile(opt.teacher_path):
         kaggle_root = '/kaggle/input'
         found = None
@@ -246,7 +249,6 @@ if __name__ == "__main__":
     if isfile(opt.teacher_path):
         checkpoint = torch.load(opt.teacher_path, map_location=device, weights_only=False)
         teacher.load_state_dict(checkpoint['state_dict'])
-        # 確保老師模型的參數不會計算梯度，避免不必要的顯存消耗
         for param in teacher.parameters():
             param.requires_grad = False
         print(f"成功載入老師模型權重: {opt.teacher_path}")
@@ -255,8 +257,9 @@ if __name__ == "__main__":
     teacher.eval()
 
     print('===> 初始化 MobileNetV3 + Spatial Attention 學生模型')
-    # 預設輸入為 160x160，若你的資料集 BEV 影像為其他尺寸，請修改下方的 feat_h 與 feat_w 參數
     student = StudentREIN(teacher_global_dim=8192, feat_h=40, feat_w=40).to(device)
+    if not hasattr(student, 'global_pool'):
+        raise RuntimeError('目前載入的 StudentREIN 不含 global_pool 修正，請確認 Kaggle 執行的是更新後的 REIN.py')
 
     writer = SummaryWriter(log_dir=join(opt.runsPath, datetime.now().strftime('%b%d_%H-%M-%S')))
     logdir = writer.file_writer.get_logdir()
@@ -268,7 +271,9 @@ if __name__ == "__main__":
     train_set = kitti_dataset.TrainingDataset(dataset_path=opt.kitti_path) 
     optimizer = optim.Adam(filter(lambda p: p.requires_grad, student.parameters()), lr=opt.lr)    
     criterion = TripletLoss().to(device)
-    distill_criterion = nn.MSELoss().to(device) # 蒸餾使用的 MSE 相似度矩陣
+    
+    # 🔥 核心修正：將 reduction 改為 'sum'，治本解除維度稀釋問題
+    distill_criterion = nn.MSELoss(reduction='sum').to(device) 
     best_score = 0
 
     print("===> 開始執行知識蒸餾訓練流程")
@@ -303,9 +308,8 @@ if __name__ == "__main__":
         print(f"=== Epoch {epoch} 結束 === 學生 NCLT 平均 Recall@1: {mean_recall*100:.2f}%")
         del eval_global_descs, eval_datasets; gc.collect()
 
-        # 保存學生 Checkpoint
         is_best = mean_recall > best_score 
-        if is_best: 
+        if_best: 
             best_score = mean_recall
         
         filename = logdir + '/checkpoint.pth.tar'
@@ -320,3 +324,4 @@ if __name__ == "__main__":
             shutil.copyfile(filename, logdir + '/model_best.pth.tar')
 
     writer.close()
+
