@@ -255,12 +255,8 @@ class StudentREIN(nn.Module):
         
         # 【核心修改】用 Spatial Attention 替換原本的 NetVLAD
         self.spatial_attention = SpatialAttention(kernel_size=7)
-        
-        # 為了能和老師的 Global Descriptor (8192維) 計算 Loss_Global，並且相容 main.py 的 Cache 與測試系統
-        # 我們將 Attention 加權後的特徵圖 Flatten，再用一個全連接層（Linear）投影到 8192 維度！
-        # 註：若輸入 BEV 影像為 160x160，降採樣 4 倍後特徵圖即為 40x40
-        self.flat_features_dim = 128 * feat_h * feat_w
-        self.fc_global = nn.Linear(self.flat_features_dim, teacher_global_dim)
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc_global = nn.Linear(128, teacher_global_dim)
 
         # 變數名稱對齊原本的 REIN，確保 main.py 讀取時不會噴錯
         self.local_feat_dim = 128
@@ -273,10 +269,10 @@ class StudentREIN(nn.Module):
         # 2. 將 out1 餵入幾何空間注意力機制中
         attn_feats = self.spatial_attention(out1)
         
-        # 3. 展平並映射成全局描述子（Global Descriptor）
+        # 3. 以自適應池化產生固定維度的全局描述子，避免輸入尺寸改變時 fc 維度不匹配
         B = x.size(0)
-        flat_feats = attn_feats.view(B, -1)
-        global_desc = self.fc_global(flat_feats)
+        pooled_feats = self.global_pool(attn_feats).view(B, self.local_feat_dim)
+        global_desc = self.fc_global(pooled_feats)
         global_desc = F.normalize(global_desc, p=2, dim=1) # L2 歸一化
         
         # 防護：確保 local_feats 為 4D 張量 (B, C, H, W)，否則上游的插值會失敗
