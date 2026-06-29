@@ -35,6 +35,8 @@ def get_args():
     parser.add_argument('--runsPath', type=str, default='./runs_distill/', help='Path to save runs to.')
     parser.add_argument('--cachePath', type=str, default='./cache_distill/', help='Path to save cache to.')
     parser.add_argument('--teacher_path', type=str, default='./runs/Aug08_10-17-29/model_best.pth.tar', help='老師模型權重路徑 (.pth.tar)')
+    parser.add_argument('--kitti_path', type=str, default='./datasets/KITTI/', help='KITTI 資料集根目錄')
+    parser.add_argument('--nclt_path', type=str, default='./datasets/NCLT/', help='NCLT 資料集根目錄')
     
     # 蒸餾超參數 (公式中的 α 和 β)
     parser.add_argument('--alpha', type=float, default=1.0, help='Loss_Global 權重')
@@ -242,7 +244,7 @@ if __name__ == "__main__":
             opt.teacher_path = found
 
     if isfile(opt.teacher_path):
-        checkpoint = torch.load(opt.teacher_path, map_location=device)
+        checkpoint = torch.load(opt.teacher_path, map_location=device, weights_only=False)
         teacher.load_state_dict(checkpoint['state_dict'])
         # 確保老師模型的參數不會計算梯度，避免不必要的顯存消耗
         for param in teacher.parameters():
@@ -260,7 +262,10 @@ if __name__ == "__main__":
     logdir = writer.file_writer.get_logdir()
     if not exists(logdir): makedirs(logdir)
 
-    train_set = kitti_dataset.TrainingDataset() 
+    print(f"===> 使用 KITTI 路徑: {opt.kitti_path}")
+    print(f"===> 使用 NCLT 路徑: {opt.nclt_path}")
+
+    train_set = kitti_dataset.TrainingDataset(dataset_path=opt.kitti_path) 
     optimizer = optim.Adam(filter(lambda p: p.requires_grad, student.parameters()), lr=opt.lr)    
     criterion = TripletLoss().to(device)
     distill_criterion = nn.MSELoss().to(device) # 蒸餾使用的 MSE 相似度矩陣
@@ -273,7 +278,7 @@ if __name__ == "__main__":
         # 測試學生的 KITTI 表現
         recalls_kitti = []
         for seq in ['00', '02', '05', '06', '08']:
-            test_set = kitti_dataset.InferDataset(seq=seq)   
+            test_set = kitti_dataset.InferDataset(seq=seq, dataset_path=opt.kitti_path)   
             global_descs = infer(test_set, student, opt, device)
             recall_top1 = kitti_dataset.evaluateResults(seq, global_descs, None, test_set)
             recalls_kitti.append(recall_top1)
@@ -285,7 +290,7 @@ if __name__ == "__main__":
         eval_datasets = []
         eval_global_descs = []
         for seq in eval_seq:   
-            test_set = nclt_dataset.InferDataset(seq=seq)   
+            test_set = nclt_dataset.InferDataset(seq=seq, dataset_path=opt.nclt_path)   
             global_descs = infer(test_set, student, opt, device)
             eval_global_descs.append(global_descs)
             eval_datasets.append(test_set)
