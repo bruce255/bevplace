@@ -13,241 +13,217 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, SubsetRandomSampler
+from torch.utils.data import DataLoader
 import h5py
-
-from sklearn.decomposition import PCA
-
 from tensorboardX import SummaryWriter
 import numpy as np
-
 from tqdm import tqdm
-import faiss
-from uuid import uuid4
 
 import kitti_dataset
 import nclt_dataset 
+import REIN as rein_module
+from REIN import REIN, StudentREIN
 
 def get_args():
-    parser = argparse.ArgumentParser(description='BEVPlace++')
-    parser.add_argument('--mode', type=str, default='test', help='Mode', choices=['train', 'test'])
+    parser = argparse.ArgumentParser(description='BEVPlace++ 知識蒸餾（治本修正版）')
     parser.add_argument('--batchSize', type=int, default=4, help='Number of triplets')
-    parser.add_argument('--cacheBatchSize', type=int, default=128, help='Batch size for caching and testing')
-    parser.add_argument('--nEpochs', type=int, default=40, help='number of epochs to train for')
-    parser.add_argument('--nGPU', type=int, default=2, help='number of GPU to use.')
+    parser.add_argument('--cacheBatchSize', type=int, default=8, help='Batch size for caching and testing')
+    parser.add_argument('--nEpochs', type=int, default=10, help='number of epochs to train for')
     parser.add_argument('--lr', type=float, default=0.0001, help='Learning Rate.')
-    parser.add_argument('--lrStep', type=float, default=10, help='Decay LR ever N steps.')
-    parser.add_argument('--lrGamma', type=float, default=0.5, help='Multiply LR by Gamma for decaying.')
-    parser.add_argument('--weightDecay', type=float, default=0.001, help='Weight decay for SGD.')
-    parser.add_argument('--momentum', type=float, default=0.9, help='Momentum for SGD.')
-    parser.add_argument('--threads', type=int, default=24, help='Number of threads for data loader')
+    parser.add_argument('--threads', type=int, default=4, help='Number of threads for data loader')
     parser.add_argument('--seed', type=int, default=1024, help='Random seed to use.')
-    parser.add_argument('--runsPath', type=str, default='./runs/', help='Path to save runs to.')
-    parser.add_argument('--cachePath', type=str, default='./cache/', help='Path to save cache to.')
-    parser.add_argument('--load_from', type=str, default='', help='Path to load checkpoint.')
-    parser.add_argument('--ckpt', type=str, default='best', choices=['latest', 'best'])
+    parser.add_argument('--runsPath', type=str, default='./runs_distill/', help='Path to save runs to.')
+    parser.add_argument('--cachePath', type=str, default='./cache_distill/', help='Path to save cache to.')
+    parser.add_argument('--teacher_path', type=str, default='./runs/Aug08_10-17-29/model_best.pth.tar', help='老師模型權重路徑 (.pth.tar)')
+    parser.add_argument('--kitti_path', type=str, default='./datasets/KITTI/', help='KITTI 資料集根目錄')
+    parser.add_argument('--nclt_path', type=str, default='./datasets/NCLT/', help='NCLT 資料集根目錄')
+    
+    # 數學對齊後，超參數回歸正常合理的 1.0 範圍
+    parser.add_argument('--alpha', type=float, default=1.0, help='Loss_Global 權重')
+    parser.add_argument('--beta', type=float, default=1.0, help='Loss_Spatial 權重')
     
     opt = parser.parse_args()
     return opt
-#=====================================================================================================================================#
-#                                                               三源組損失函數                                                          #
-#=====================================================================================================================================#
-
-# 說明：Triplet Loss 是一種常用於度量學習的損失函數，旨在將相似的樣本拉近，將不相似的樣本推遠。它通常使用三個樣本：anchor（錨點）、positive（正樣本）和negative（負樣本）。目標是使 anchor 與 positive 的距離小於 anchor 與 negative 的距離，並且至少有一個 margin（邊界）。
 
 class TripletLoss(nn.Module):
     def __init__(self):
         super(TripletLoss, self).__init__()
         self.margin = 0.3
-
     def forward(self, anchor, positive, negative):
-        pos_dist = torch.sqrt((anchor - positive).pow(2).sum())
-        neg_dist = torch.sqrt((anchor - negative).pow(2).sum(1))
+        if anchor.dim() == 1:
+            pos_dist = torch.norm(anchor - positive, p=2)
+            neg_dist = torch.norm(anchor.unsqueeze(0) - negative, dim=1, p=2)
+        else:
+            pos_dist = torch.norm(anchor - positive, dim=-1, p=2)
+            neg_dist = torch.norm(anchor.unsqueeze(1) - negative, dim=-1, p=2)
+
         loss = F.relu(pos_dist - neg_dist + self.margin)
         return loss
-#=====================================================================================================================================#
-# 在 CARLA 裡，train_epoch 就像一次完整的「自駕車訓練遊戲回合」，從場景資料、模型推理、評分，到優化更新，最後把結果記錄下來。
-#=====================================================================================================================================#
-def train_epoch(epoch, model, train_set, optimizer, criterion, writer, device, opt):
-    #第0回合用於初始化
+
+def train_epoch_distill(epoch, teacher_model, student_model, train_set, optimizer, criterion, distill_criterion, writer, device, opt):
     epoch_loss = 0
-    #計算幾個batchh需要訓練完一輪，這裡是根據訓練集的大小和每批次的大小來計算的，確保即使最後一批次不滿，也能正確處理。
     n_batches = (len(train_set) + opt.batchSize - 1) // opt.batchSize
     
-    # 1. Building Cache (優化：顯存清理)
+    # ====== 1. Building Cache (🔥 核心對齊：強迫用 99% 的老師來幫學生做 Hard Mining 篩選) ======
     if epoch >= 0:
-        print('====> Building Cache for Hard Mining')
-        #因為預設的 train_set.mining 是 True，這裡先設為 False，避免在建立緩存時進行困難樣本挖掘。
+        print('====> Building Cache for Hard Mining (Using 99% Teacher Model)')
         train_set.mining = False
-        #建立cache的路徑，這裡是將 opt.cachePath 與 'train_feat_cache.hdf5' 組合成完整的路徑，用於存儲訓練特徵的緩存文件。
         train_set.cache = join(opt.cachePath, 'train_feat_cache.hdf5')
         
         if not exists(opt.cachePath):
             makedirs(opt.cachePath)
-        #建立新的 HDF5 檔案，並在其中創建一個名為 "features" 的資料集，用於存儲訓練樣本的全局特徵向量。 
-        with h5py.File(train_set.cache, mode='w') as h5: 
-            pool_size = model.global_feat_dim
-            #在剛開的 HDF5 檔案裡建立一個名叫 features 的資料集（類似 Excel 裡的一個工作表或表格）
+            
+        tmp_cache = train_set.cache + '.tmp'
+        with h5py.File(tmp_cache, mode='w') as h5: 
+            # 注意：這裡的 pool_size 必須是老師模型的輸出維度（也是學生的 global_feat_dim，兩者均為 8192）
+            pool_size = teacher_model.global_feat_dim  
             h5feat = h5.create_dataset("features", [len(train_set), pool_size], dtype=np.float32)
-            #DataLoader = 自動幫你分批、打亂、多執行緒預載的資料管線  自動打包要處理的資料=>加速用
+            
             training_data_loader = DataLoader(dataset=train_set, num_workers=opt.threads, 
                                              batch_size=opt.cacheBatchSize, shuffle=False, 
                                              collate_fn=kitti_dataset.collate_fn)
-            model.eval()
-            #這個程式碼段落是在建立特徵緩存，為後續的困難樣本挖掘（Hard Mining）做準備。
+            
+            # 凍結老師進行高質量快取提取
+            teacher_model.eval()
             with torch.no_grad():
                 for iteration, (query, _, _, indices) in enumerate(training_data_loader, 1):
                     query = query.to(device)
-                    _, _, global_descs = model(query)
-                    #將 global_descs 的 NumPy 版本，寫入 h5feat 的 indices 這些列，覆蓋對應的所有欄位。
+                    _, _, global_descs = teacher_model(query)
                     h5feat[indices, :] = global_descs.detach().cpu().numpy()
-                    
+
+        try:
+            os.replace(tmp_cache, train_set.cache)
+        except Exception:
+            try:
+                os.rename(tmp_cache, train_set.cache)
+            except Exception:
+                raise
+
         train_set.mining = True
         train_set.refreshCache()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    # 2. 正式訓練循環 (優化：分批前向傳播，避免 cat 導致 OOM)
+    # ====== 2. 蒸餾訓練主循環 ======
     training_data_loader = DataLoader(dataset=train_set, num_workers=opt.threads, 
                                      batch_size=opt.batchSize, shuffle=True, 
                                      collate_fn=kitti_dataset.collate_fn)
-    model.train()
+    
+    teacher_model.eval() 
+    student_model.train()
 
     for iteration, (query, positives, negatives, indices) in enumerate(training_data_loader):
         B = query.shape[0]
         num_negs = negatives.shape[0] // B
 
-        # 這裡改成單獨 forward 提取，或者分開送入，避免一次過大
         query = query.to(device)
         positives = positives.to(device)
         negatives = negatives.to(device)
 
         optimizer.zero_grad()
 
-        # 分別 forward，大幅度節省疊加帶來的顯存峰值
-        _, _, global_descs_Q = model(query)
-        _, _, global_descs_P = model(positives)
-        _, _, global_descs_N = model(negatives)
+        # 老師同步提取完整三元組特徵
+        with torch.no_grad():
+            _, t_local_Q, t_global_Q = teacher_model(query)
+            _, t_local_P, t_global_P = teacher_model(positives)
+            _, t_local_N, t_global_N = teacher_model(negatives)
 
-        loss = 0
+        # 學生提取對應特徵
+        _, s_local_Q, s_global_Q = student_model(query)
+        _, s_local_P, s_global_P = student_model(positives)
+        _, s_local_N, s_global_N = student_model(negatives)
+
+        # --- 損失函數計算 ---
+        
+        # (1) Loss_Triplet (學生自學，維護基本邊界)
+        loss_triplet = torch.tensor(0.0, device=device)
         for i in range(B):
             max_loss = torch.max(criterion(
-                global_descs_Q[i], 
-                global_descs_P[i], 
-                global_descs_N[num_negs * i : num_negs * (i + 1)]
+                s_global_Q[i], 
+                s_global_P[i], 
+                s_global_N[num_negs * i : num_negs * (i + 1)]
             ))
-            loss += max_loss
+            loss_triplet += max_loss
+        loss_triplet /= B
         
-        loss /= B
-        loss.backward()
+        # (2) Loss_Global (全局特徵蒸餾 - 採用 sum 並除以實際總元素量，治本對齊數量級)
+        total_samples = B + B + (B * num_negs)
+        loss_global_sum = distill_criterion(s_global_Q, t_global_Q) + \
+                           distill_criterion(s_global_P, t_global_P) + \
+                           distill_criterion(s_global_N, t_global_N)
+        loss_global = loss_global_sum / total_samples
+        
+        # (3) Loss_Spatial (空間特徵蒸餾 - 壓縮通道維度，避免規格不對稱)
+        t_spatial_Q = t_local_Q.mean(dim=1, keepdim=True)
+        t_spatial_P = t_local_P.mean(dim=1, keepdim=True)
+        t_spatial_N = t_local_N.mean(dim=1, keepdim=True)
+
+        s_spatial_Q = s_local_Q.mean(dim=1, keepdim=True)
+        s_spatial_P = s_local_P.mean(dim=1, keepdim=True)
+        s_spatial_N = s_local_N.mean(dim=1, keepdim=True)
+
+        if s_spatial_Q.shape[2:] != t_spatial_Q.shape[2:]:
+            s_spatial_Q = F.interpolate(s_spatial_Q, size=t_spatial_Q.shape[2:], mode='bilinear', align_corners=False)
+            s_spatial_P = F.interpolate(s_spatial_P, size=t_spatial_P.shape[2:], mode='bilinear', align_corners=False)
+            s_spatial_N = F.interpolate(s_spatial_N, size=t_spatial_N.shape[2:], mode='bilinear', align_corners=False)
+
+        spatial_pixels = t_spatial_Q.shape[2] * t_spatial_Q.shape[3]
+        total_spatial_elements = total_samples * spatial_pixels
+        
+        loss_spatial_sum = distill_criterion(s_spatial_Q, t_spatial_Q) + \
+                            distill_criterion(s_spatial_P, t_spatial_P) + \
+                            distill_criterion(s_spatial_N, t_spatial_N)
+        loss_spatial = loss_spatial_sum / total_spatial_elements
+        
+        # 總損失結合
+        loss_total = loss_triplet + (opt.alpha * loss_global) + (opt.beta * loss_spatial)
+
+        # 反向傳播與更新
+        loss_total.backward()
         optimizer.step()
 
-        batch_loss = loss.item()
+        batch_loss = loss_total.item()
         epoch_loss += batch_loss
         
         if iteration % 50 == 0 or n_batches <= 10:
-            print("==> Epoch[{}]({}/{}): Loss: {:.4f}".format(epoch, iteration, n_batches, batch_loss), flush=True)
-            writer.add_scalar('Train/Loss', batch_loss, ((epoch - 1) * n_batches) + iteration)
+            print("==> Epoch[{}]({}/{}): Loss: {:.4f} | Triplet: {:.4f} | Global_KD: {:.4f} | Spatial_KD: {:.4f}".format(
+                epoch, iteration, n_batches, batch_loss, loss_triplet.item(), loss_global.item(), loss_spatial.item()), flush=True)
+            step = (epoch * n_batches) + iteration
+            writer.add_scalar('Train/Loss', batch_loss, step)
+            writer.add_scalar('Train/Triplet', loss_triplet.item(), step)
+            writer.add_scalar('Train/Global_KD', loss_global.item(), step)
+            writer.add_scalar('Train/Spatial_KD', loss_spatial.item(), step)
 
     avg_loss = epoch_loss / n_batches
-    print("===> Epoch {} Complete: Avg. Loss: {:.4f}".format(epoch, avg_loss), flush=True)
+    print("===> Epoch {} 蒸餾完成! 平均 Loss: {:.4f}".format(epoch, avg_loss), flush=True)
     writer.add_scalar('Train/AvgLoss', avg_loss, epoch)
-    
-    # 訓練完一輪立刻釋放顯存
-    torch.cuda.empty_cache()
-
-def infer(eval_set, model_ptr, opt, device, return_local_feats=False):
-    test_data_loader = DataLoader(dataset=eval_set, num_workers=opt.threads,
-                                  batch_size=opt.cacheBatchSize, shuffle=False)
-    model_ptr.eval()
-
-    num_samples = len(eval_set)
-    global_dim = 512 * 128
-
-    if not exists(opt.cachePath):
-        makedirs(opt.cachePath)
-
-    # create memmap files to avoid allocating large arrays in RAM
-    gpath = join(opt.cachePath, f"global_descs_{uuid4().hex}.npy")
-    all_global_descs = np.memmap(gpath, dtype='float32', mode='w+', shape=(num_samples, global_dim))
-
-    all_local_feats = None
-    lpath = None
-
-    with torch.no_grad():
-        for idx, (imgs, _) in enumerate(tqdm(test_data_loader, desc="Extracting")):
-            imgs = imgs.to(device)
-            _, local_feat, global_desc = model_ptr(imgs)
-
-            start_idx = idx * opt.cacheBatchSize
-            end_idx = start_idx + imgs.shape[0]
-
-            all_global_descs[start_idx:end_idx] = global_desc.detach().cpu().numpy()
-
-            if return_local_feats:
-                local_feat_np = local_feat.detach().cpu().numpy()
-                if all_local_feats is None:
-                    local_shape = (num_samples, *local_feat_np.shape[1:])
-                    lpath = join(opt.cachePath, f"local_feats_{uuid4().hex}.npy")
-                    all_local_feats = np.memmap(lpath, dtype='float32', mode='w+', shape=local_shape)
-                all_local_feats[start_idx:end_idx] = local_feat_np
-
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    if return_local_feats:
-        return all_local_feats, all_global_descs
-    else:
-        return all_global_descs
-
-def getClusters(cluster_set, model, device, opt):
-    n_descriptors = 10000
-    n_per_image = 25
-    n_im = ceil(n_descriptors / n_per_image)
-
-    sampler = SubsetRandomSampler(np.random.choice(len(cluster_set), n_im, replace=False))
-    data_loader = DataLoader(dataset=cluster_set, num_workers=opt.threads, 
-                             batch_size=opt.cacheBatchSize, shuffle=False, sampler=sampler)
-
-    if not exists(opt.cachePath):
-        makedirs(opt.cachePath)
-
-    initcache = join(opt.cachePath, 'desc_cen.hdf5')
-    with h5py.File(initcache, mode='w') as h5: 
-        with torch.no_grad():
-            model.eval()
-            print('====> Extracting Descriptors')
-            all_feats = h5.create_dataset("descriptors", [n_descriptors, 128], dtype=np.float32)
-
-            for iteration, (query, _, _, _) in enumerate(data_loader, 1):
-                query = query.to(device)
-                local_feat, _, _ = model(query)
-                local_feat = local_feat.view(query.size(0), 128, -1).permute(0, 2, 1)
+def infer(eval_set, model_ptr, opt, device):
+    test_data_loader = DataLoader(dataset=eval_set, num_workers=opt.threads, batch_size=opt.cacheBatchSize, shuffle=False)
+    model_ptr.eval()
+    num_samples = len(eval_set)
+    global_dim = model_ptr.global_feat_dim  
+    all_global_descs = np.zeros((num_samples, global_dim), dtype=np.float32)
+    
+    with torch.no_grad():
+        for idx, (imgs, _) in enumerate(tqdm(test_data_loader, desc="Extracting")):
+            imgs = imgs.to(device)
+            _, _, global_desc = model_ptr(imgs)
+            start_idx = idx * opt.cacheBatchSize
+            end_idx = start_idx + imgs.shape[0]
+            all_global_descs[start_idx:end_idx] = global_desc.detach().cpu().numpy()
                 
-                batchix = (iteration - 1) * opt.cacheBatchSize * n_per_image
-                for ix in range(local_feat.size(0)):
-                    sample = np.random.choice(local_feat.size(1), n_per_image, replace=False)
-                    startix = batchix + ix * n_per_image
-                    all_feats[startix:startix + n_per_image, :] = local_feat[ix, sample, :].detach().cpu().numpy()
-
-        print('====> Clustering..')
-        # Sample a subset of descriptors for kmeans training to avoid loading everything
-        sample_n = min(5000, n_descriptors)
-        sample_idx = np.random.choice(n_descriptors, sample_n, replace=False)
-        sample_feats = all_feats[sample_idx]
-
-        kmeans = faiss.Kmeans(128, 64, niter=100, verbose=False)
-        kmeans.train(sample_feats)
-        h5.create_dataset('centroids', data=kmeans.centroids)
-
-def saveCheckpoint(state, is_best, model_out_path, filename='checkpoint.pth.tar'):
-    filename = model_out_path + '/' + filename
-    torch.save(state, filename)
-    if is_best:
-        shutil.copyfile(filename, model_out_path + '/' + 'model_best.pth.tar')
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return all_global_descs
 
 if __name__ == "__main__":
     opt = get_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print(f"===> 載入的 REIN.py: {rein_module.__file__}")
 
     random.seed(opt.seed)
     np.random.seed(opt.seed)
@@ -255,118 +231,96 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         torch.cuda.manual_seed(opt.seed)
 
-    print('===> Building model')
-    from REIN import REIN
-    model = REIN().to(device)
+    print('===> 載入預訓練的 ResNet34 + NetVLAD 老師模型')
+    teacher = REIN().to(device)
     
-    if opt.load_from != '':
-        resume_ckpt = join(opt.load_from, 'model_best.pth.tar' if opt.ckpt.lower() == 'best' else 'checkpoint.pth.tar')
-        if isfile(resume_ckpt):
-            print(f"=> loading checkpoint '{resume_ckpt}'")
-            checkpoint = torch.load(resume_ckpt, map_location=device)
-            model.load_state_dict(checkpoint['state_dict'])
-        else:
-            print(f"=> no checkpoint found at '{resume_ckpt}'")
+    if not isfile(opt.teacher_path):
+        kaggle_root = '/kaggle/input'
+        found = None
+        if exists(kaggle_root):
+            for root, dirs, files in os.walk(kaggle_root):
+                if 'model_best.pth.tar' in files:
+                    found = os.path.join(root, 'model_best.pth.tar')
+                    break
+        if found:
+            print(f"老師模型路徑不存在，已自動找到: {found}")
+            opt.teacher_path = found
+
+    if isfile(opt.teacher_path):
+        checkpoint = torch.load(opt.teacher_path, map_location=device, weights_only=False)
+        teacher.load_state_dict(checkpoint['state_dict'])
+        for param in teacher.parameters():
+            param.requires_grad = False
+        print(f"成功載入老師模型權重: {opt.teacher_path}")
     else:
-        initcache = join(opt.cachePath, 'desc_cen.hdf5')
-        if not isfile(initcache):
-            train_set = kitti_dataset.TrainingDataset()
-            getClusters(train_set, model, device, opt)
-        with h5py.File(initcache, mode='r') as h5: 
-            clsts = h5.get("centroids")[...]
-            traindescs = h5.get("descriptors")[...]
-            model.pooling.init_params(clsts, traindescs) 
-            model = model.to(device)
+        raise FileNotFoundError(f"未能在該路徑找到老師模型權重，請確認路徑設定: {opt.teacher_path}")
+    teacher.eval()
 
-    if opt.mode.lower() == 'train':
-        writer = SummaryWriter(log_dir=join(opt.runsPath, datetime.now().strftime('%b%d_%H-%M-%S')))
-        logdir = writer.file_writer.get_logdir()
-        if not exists(logdir): makedirs(logdir)
+    print('===> 初始化 MobileNetV3 + Spatial Attention 學生模型')
+    student = StudentREIN(teacher_global_dim=8192, feat_h=40, feat_w=40).to(device)
+    if not hasattr(student, 'global_pool'):
+        raise RuntimeError('目前載入的 StudentREIN 不含 global_pool 修正，請確認 Kaggle 執行的是更新後的 REIN.py')
 
-        with open(join(logdir, 'flags.json'), 'w') as f:
-            f.write(json.dumps({k: v for k, v in vars(opt).items()}))
+    writer = SummaryWriter(log_dir=join(opt.runsPath, datetime.now().strftime('%b%d_%H-%M-%S')))
+    logdir = writer.file_writer.get_logdir()
+    if not exists(logdir): makedirs(logdir)
 
-        train_set = kitti_dataset.TrainingDataset() 
-        optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=opt.lr)    
-        criterion = TripletLoss().to(device)
-        best_score = 0
+    print(f"===> 使用 KITTI 路徑: {opt.kitti_path}")
+    print(f"===> 使用 NCLT 路徑: {opt.nclt_path}")
 
-        for epoch in range(opt.nEpochs):
-            train_epoch(epoch, model, train_set, optimizer, criterion, writer, device, opt)
-            
-            # 訓練中的簡化測試（避免多序列堆疊 OOM）
-            recalls_kitti = []
-            for seq in ['00', '02', '05', '06', '08']:
-                test_set = kitti_dataset.InferDataset(seq=seq)   
-                global_descs = infer(test_set, model, opt, device)
-                recall_top1 = kitti_dataset.evaluateResults(seq, global_descs, None, test_set)
-                recalls_kitti.append(recall_top1)
-                writer.add_scalars('val', {'KITTI_' + seq: recall_top1}, epoch)
-                del global_descs, test_set; gc.collect()
+    train_set = kitti_dataset.TrainingDataset(dataset_path=opt.kitti_path) 
+    optimizer = optim.Adam(filter(lambda p: p.requires_grad, student.parameters()), lr=opt.lr)    
+    criterion = TripletLoss().to(device)
+    
+    # 🔥 核心修正：將 reduction 改為 'sum'，治本解除維度稀釋問題
+    distill_criterion = nn.MSELoss(reduction='sum').to(device) 
+    best_score = 0
 
-            # NCLT 訓練中測試優化：不採用 append 堆疊，直接一條一條處理並拿 recall
-            eval_seq = ['2012-01-15', '2012-02-04', '2012-03-17', '2012-06-15', '2012-09-28', '2012-11-16', '2013-02-23']
-            # Use first sequence as the database and process queries one-by-one
-            db_seq = eval_seq[0]
-            db_set = nclt_dataset.InferDataset(seq=db_seq)
-            db_descs = infer(db_set, model, opt, device)
-            recalls_nclt = []
-            for seq in eval_seq[1:]:
-                test_set = nclt_dataset.InferDataset(seq=seq)
-                q_descs = infer(test_set, model, opt, device)
-                r = nclt_dataset.evaluateResults([db_descs, q_descs], [db_set, test_set])
-                recalls_nclt.append(r[0] if len(r) > 0 else 0.0)
-                writer.add_scalars('val', {'NCLT_' + seq: recalls_nclt[-1]}, epoch)
-                del q_descs, test_set; gc.collect()
-
-            mean_recall = np.mean(recalls_nclt)
-            del db_descs, db_set; gc.collect()
-
-            is_best = mean_recall > best_score 
-            if is_best: best_score = mean_recall
-            
-            saveCheckpoint({
-                    'epoch': epoch,
-                    'state_dict': model.state_dict(),
-                    'recalls': mean_recall,
-                    'best_score': best_score,
-                    'optimizer': optimizer.state_dict(),
-            }, is_best, logdir)
-
-        writer.close()
-
-    elif opt.mode.lower() == 'test':
-        print('===> Running evaluation step')
+    print("===> 開始執行知識蒸餾訓練流程")
+    for epoch in range(opt.nEpochs):
+        train_epoch_distill(epoch, teacher, student, train_set, optimizer, criterion, distill_criterion, writer, device, opt)
+        
+        # 測試學生的 KITTI 表現
         recalls_kitti = []
-        eval_seq_kitti = ['08']
-
-        for seq in eval_seq_kitti:   
-            if seq == '08':
-                test_set = kitti_dataset.InferDataset(seq=seq, sample_inteval=5)  
-                local_feats, global_descs = infer(test_set, model, opt, device, return_local_feats=True)  
-                recall_top1, success_rate, mean_trans_err, mean_rot_err = kitti_dataset.evaluateResults(seq, global_descs, local_feats, test_set, "out_imgs/")
-                del local_feats
-            else:
-                test_set = kitti_dataset.InferDataset(seq=seq)  
-                global_descs = infer(test_set, model, opt, device)
-                recall_top1 = kitti_dataset.evaluateResults(seq, global_descs, None, test_set)
+        for seq in ['00', '02', '05', '06', '08']:
+            test_set = kitti_dataset.InferDataset(seq=seq, dataset_path=opt.kitti_path)   
+            global_descs = infer(test_set, student, opt, device)
+            recall_top1 = kitti_dataset.evaluateResults(seq, global_descs, None, test_set)
             recalls_kitti.append(recall_top1)
+            writer.add_scalars('val', {'KITTI_' + seq: recall_top1}, epoch)
             del global_descs, test_set; gc.collect()
 
-        print('====> Extracting Features of NCLT (優化版防爆)')
+        # 測試學生的 NCLT 表現
         eval_seq = ['2012-01-15', '2012-02-04', '2012-03-17', '2012-06-15', '2012-09-28', '2012-11-16', '2013-02-23']
-        # Build index from the first sequence and search each remaining sequence sequentially
-        db_seq = eval_seq[0]
-        print(f'Building NCLT index from {db_seq}')
-        db_set = nclt_dataset.InferDataset(seq=db_seq)
-        db_descs = infer(db_set, model, opt, device)
-        recalls_nclt = []
-        for seq in eval_seq[1:]:
-            print(f'Processing NCLT sequence: {seq}')
-            test_set = nclt_dataset.InferDataset(seq=seq)
-            q_descs = infer(test_set, model, opt, device)
-            r = nclt_dataset.evaluateResults([db_descs, q_descs], [db_set, test_set])
-            recalls_nclt.append(r[0] if len(r) > 0 else 0.0)
-            del q_descs, test_set; torch.cuda.empty_cache(); gc.collect()
-        print('NCLT Mean Recall: %0.2f' % (np.mean(recalls_nclt) * 100))
-        del db_descs, db_set; gc.collect()
+        eval_datasets = []
+        eval_global_descs = []
+        for seq in eval_seq:   
+            test_set = nclt_dataset.InferDataset(seq=seq, dataset_path=opt.nclt_path)   
+            global_descs = infer(test_set, student, opt, device)
+            eval_global_descs.append(global_descs)
+            eval_datasets.append(test_set)
+        recalls_nclt = nclt_dataset.evaluateResults(eval_global_descs, eval_datasets)
+        
+        for ii in range(len(recalls_nclt)):
+            writer.add_scalars('val', {'NCLT_' + eval_seq[ii]: recalls_nclt[ii]}, epoch)
+        
+        mean_recall = np.mean(recalls_nclt)
+        print(f"=== Epoch {epoch} 結束 === 學生 NCLT 平均 Recall@1: {mean_recall*100:.2f}%")
+        del eval_global_descs, eval_datasets; gc.collect()
+
+        is_best = mean_recall > best_score 
+        if_best: 
+            best_score = mean_recall
+        
+        filename = logdir + '/checkpoint.pth.tar'
+        torch.save({
+                'epoch': epoch,
+                'state_dict': student.state_dict(),
+                'recalls': mean_recall,
+                'best_score': best_score,
+                'optimizer': optimizer.state_dict(),
+        }, filename)
+        if is_best:
+            shutil.copyfile(filename, logdir + '/model_best.pth.tar')
+
+    writer.close()
